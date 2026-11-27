@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required documentation files exist
+        run: |
+          set -e
+          for f in \
+            README.md \
+            LICENSE \
+            CONTRIBUTING.md \
+            SECURITY.md \
+            docs/VISION.md \
+            docs/ARCHITECTURE.md \
+            docs/RESEARCH.md \
+            docs/ALGORITHMS.md \
+            docs/ROADMAP.md \
+            docs/BENCHMARKS.md \
+            docs/PRIVACY.md
+          do
+            if [ ! -f "$f" ]; then
+              echo "Missing required file: $f"
+              exit 1
+            fi
+            echo "OK: $f"
+          done
+
+  profiler-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build
+      - name: Configure
+        working-directory: experiments/memory-profiler-0.1
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        working-directory: experiments/memory-profiler-0.1
+        run: cmake --build build
+      - name: Run unit tests
+        working-directory: experiments/memory-profiler-0.1
+        run: ctest --test-dir build --output-on-failure
+      - name: Smoke run (no model)
+        working-directory: experiments/memory-profiler-0.1
+        run: ./build/fars-memory-profiler --help || true
+        # Full runs require manual model placement; CI only validates build + basic tests.

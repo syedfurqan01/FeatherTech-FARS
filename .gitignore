@@ -1,0 +1,56 @@
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Model weights (never commit)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+models/
+weights/
+
+# Profiler output
+*.json
+!package.json
+*.csv
+reports/
+results/
+*.log
+
+# Termux / Android local
+.termux/
+
+# OS
+Thumbs.db
