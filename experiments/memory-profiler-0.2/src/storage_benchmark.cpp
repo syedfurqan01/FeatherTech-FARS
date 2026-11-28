@@ -67,7 +67,8 @@ bool StorageBenchmark::prepare_file(const StorageBenchmarkConfig& cfg,std::strin
     }
     auto unique=std::chrono::steady_clock::now().time_since_epoch().count();
     path_out=(fs::path(cfg.target_dir)/("fars_storage_bench_"+std::to_string(unique)+".tmp")).string();
-    UniqueFd fd(hooks_.open_fn(path_out.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0600));
+    auto closer = [this](int f) { if (f >= 0) hooks_.close_fn(f); };
+    UniqueFd fd(hooks_.open_fn(path_out.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0600), closer);
     if(!fd){ err=std::string("open failed: ")+std::strerror(errno); path_out.clear(); return false; }
     if(!ensure_file_size(fd.get(),cfg.file_size_bytes,err)){
         fd.reset(); // close before unlink
@@ -172,7 +173,8 @@ StorageBenchmarkResult StorageBenchmark::run(const StorageBenchmarkConfig& cfg){
     if(auto err=cfg.validate(); !err.empty()){ res.error=err; return res; }
     std::string path; int raw_fd=-1; std::string err;
     if(!prepare_file(cfg,path,raw_fd,err)){ res.error=err; return res; }
-    UniqueFd fd(raw_fd); // owns descriptor until scope exit
+    auto closer = [this](int f) { if (f >= 0) hooks_.close_fn(f); };
+    UniqueFd fd(raw_fd, closer); // owns descriptor; closes via hooks_.close_fn
     res.test_file_path=path;
     switch(cfg.mode){
         case StorageTestMode::SequentialWrite: res=run_sequential_write(cfg,path,fd.get()); break;

@@ -254,37 +254,81 @@ static void test_stats_exclude_unavailable() {
     expect(st.min_bytes == 0 && st.max_bytes == 100, "stats min max");
 }
 
+
 static void test_unique_fd() {
-    // invalid fd: no close crash
     {
         fars::UniqueFd empty;
         expect(!empty, "default empty");
         expect(empty.get() == -1, "default -1");
     }
-    // open /proc/self/status or /dev/null
     int raw = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
     expect(raw >= 0, "open /dev/null");
     {
         fars::UniqueFd fd(raw);
         expect(static_cast<bool>(fd), "owns fd");
-        expect(fd.get() == raw, "get matches");
-        // move
         fars::UniqueFd fd2(std::move(fd));
         expect(!fd, "moved-from empty");
         expect(fd2.get() == raw, "move target owns");
-        int released = fd2.release();
+        // move-assignment
+        fars::UniqueFd fd3;
+        fd3 = std::move(fd2);
+        expect(!fd2, "move-assign source empty");
+        expect(fd3.get() == raw, "move-assign target");
+        int released = fd3.release();
         expect(released == raw, "release value");
-        expect(!fd2, "released empty");
-        ::close(released); // we own again after release
+        expect(!fd3, "released empty");
+        ::close(released);
     }
-    // reset closes
+    // reset same-descriptor no-op (no double-close)
     int raw2 = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
     expect(raw2 >= 0, "open2");
     {
         fars::UniqueFd fd(raw2);
+        fd.reset(raw2);
+        expect(fd.get() == raw2, "same-fd reset keeps ownership");
         fd.reset();
         expect(!fd, "after reset");
     }
+    // custom closer invoked once
+    int closes = 0;
+    int raw3 = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    expect(raw3 >= 0, "open3");
+    {
+        fars::UniqueFd fd(raw3, [&](int f) { ++closes; if (f >= 0) ::close(f); });
+        expect(static_cast<bool>(fd), "custom closer owns");
+    }
+    expect(closes == 1, "custom closer once on destroy");
+}
+
+static void test_storage_close_hook() {
+    int close_calls = 0;
+    auto hooks = fars::make_posix_io_hooks();
+    auto inner_close = hooks.close_fn;
+    hooks.close_fn = [&](int fd) {
+        ++close_calls;
+        return inner_close(fd);
+    };
+    auto dir = (fs::temp_directory_path() / ("fars_close_" + std::to_string(::getpid()))).string();
+    fs::create_directories(dir);
+    fars::StorageBenchmarkConfig c;
+    c.target_dir = dir;
+    c.file_size_bytes = 128 * 1024;
+    c.block_size_bytes = 4096;
+    c.duration_ms = 100;
+    c.max_ops = 4;
+    c.mode = fars::StorageTestMode::SequentialWrite;
+    auto r = fars::StorageBenchmark(hooks).run(c);
+    expect(r.stats.successful_ops > 0, "close-hook run ops");
+    expect(r.cleanup_ok, "close-hook cleanup");
+    expect(close_calls >= 1, "close_fn invoked at least once");
+    expect(!fs::exists(r.test_file_path), "temp removed after close");
+    // failure path: invalid dir should not require close
+    int closes_before = close_calls;
+    c.target_dir = "/no/such/fars_close_fail";
+    auto r2 = fars::StorageBenchmark(hooks).run(c);
+    expect(!r2.error.empty(), "fail path error");
+    fs::remove_all(dir);
+    (void)closes_before;
 }
 
 int main() {
@@ -301,6 +345,7 @@ int main() {
     test_storage_fsync_hook();
     test_stats_exclude_unavailable();
     test_unique_fd();
+    test_storage_close_hook();
     if (failures == 0) {
         std::cout << "Phase 1 tests: all passed\n";
         return 0;
