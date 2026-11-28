@@ -48,14 +48,25 @@ ProcessMemorySnapshot ProcessMemoryCollector::collect(std::int32_t pid) const {
         return s;
     }
 
-    if (status_res.state != MetricState::Available) {
-        // Unavailable / missing file => not found or terminated
+    if (status_res.state == MetricState::Unavailable) {
+        // Reserved for missing path (ENOENT) — not found or terminated
         s.alive = false;
         s.observe_kind = ProcessObserveKind::NotFound;
         s.vm_rss = s.vm_size = s.vm_hwm = s.vm_swap =
             MetricValue::make_unavailable(
-                status_res.detail.empty() ? "process status unreadable" : status_res.detail);
+                status_res.detail.empty() ? "file not found" : status_res.detail);
         s.notes = "process not found or terminated";
+        return s;
+    }
+
+    if (status_res.state != MetricState::Available) {
+        // Any other non-success state: do not treat as termination
+        s.alive = false;
+        s.observe_kind = ProcessObserveKind::TransientError;
+        s.vm_rss = s.vm_size = s.vm_hwm = s.vm_swap =
+            MetricValue::make_parse_error(
+                status_res.detail.empty() ? "unexpected status read failure" : status_res.detail);
+        s.notes = "unexpected status failure (not treated as termination)";
         return s;
     }
 

@@ -14,6 +14,9 @@ FileReadResult default_file_reader(std::string_view path) {
 
     UniqueFd fd(::open(p.c_str(), O_RDONLY | O_CLOEXEC));
     if (!fd) {
+        // ENOENT => Unavailable (process/file not found)
+        // EACCES/EPERM => PermissionDenied
+        // All other open failures => ParseError (treated as TransientError by process layer)
         if (errno == EACCES || errno == EPERM) {
             r.state = MetricState::PermissionDenied;
             r.detail = std::strerror(errno);
@@ -21,8 +24,8 @@ FileReadResult default_file_reader(std::string_view path) {
             r.state = MetricState::Unavailable;
             r.detail = "file not found";
         } else {
-            r.state = MetricState::Unavailable;
-            r.detail = std::strerror(errno);
+            r.state = MetricState::ParseError;
+            r.detail = std::string("open failed: ") + std::strerror(errno);
         }
         return r;
     }
@@ -33,9 +36,10 @@ FileReadResult default_file_reader(std::string_view path) {
         ssize_t n = ::read(fd.get(), tmp, sizeof(tmp));
         if (n < 0) {
             if (errno == EINTR) continue;
+            // Read errors are transient / non-ENOENT failures
             r.state = MetricState::ParseError;
-            r.detail = std::strerror(errno);
-            return r; // UniqueFd closes
+            r.detail = std::string("read failed: ") + std::strerror(errno);
+            return r;
         }
         if (n == 0) break;
         buf.insert(buf.end(), tmp, tmp + n);
@@ -43,7 +47,7 @@ FileReadResult default_file_reader(std::string_view path) {
 
     r.state = MetricState::Available;
     r.content.assign(buf.begin(), buf.end());
-    return r; // UniqueFd closes
+    return r;
 }
 
 } // namespace fars

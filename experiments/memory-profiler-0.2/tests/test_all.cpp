@@ -469,6 +469,93 @@ static void test_sampling_smaps_missing_still_success() {
     expect(sum.failed_samples == 0, "smaps miss not process failure");
 }
 
+
+static void test_enoent_notfound_early_stop() {
+    FakeClock fc;
+    auto clock_fn = [&] { return fc.now; };
+    auto sleep_fn = [&](std::chrono::milliseconds d) { fc.advance(d); };
+    auto reader = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("meminfo") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        r.detail = "file not found";
+        return r;
+    };
+    auto snap = fars::ProcessMemoryCollector(reader).collect(99991);
+    expect(snap.observe_kind == fars::ProcessObserveKind::NotFound, "ENOENT NotFound");
+    fars::SamplingEngine eng(fars::ProcessMemoryCollector(reader),
+                             fars::SystemMemoryCollector(reader), clock_fn, sleep_fn);
+    fars::SamplingConfig cfg;
+    cfg.duration_ms = 2000;
+    cfg.interval_ms = 200;
+    auto sum = eng.run(cfg, nullptr);
+    expect(sum.stopped_early, "ENOENT early stop");
+    expect(sum.not_found_samples >= 1, "ENOENT notfound count");
+    expect(sum.total_samples == sum.successful_samples + sum.failed_samples, "ENOENT accounting");
+}
+
+static void test_eio_emfile_transient_continue() {
+    FakeClock fc;
+    auto clock_fn = [&] { return fc.now; };
+    auto sleep_fn = [&](std::chrono::milliseconds d) { fc.advance(d); };
+    // Simulate open EIO / EMFILE as ParseError (what default_file_reader now emits)
+    auto reader = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("meminfo") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n";
+            return r;
+        }
+        if (p.find("status") != std::string::npos) {
+            r.state = fars::MetricState::ParseError;
+            r.detail = "open failed: Input/output error";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto snap = fars::ProcessMemoryCollector(reader).collect(12);
+    expect(snap.observe_kind == fars::ProcessObserveKind::TransientError, "EIO transient");
+    fars::SamplingEngine eng(fars::ProcessMemoryCollector(reader),
+                             fars::SystemMemoryCollector(reader), clock_fn, sleep_fn);
+    fars::SamplingConfig cfg;
+    cfg.duration_ms = 1000;
+    cfg.interval_ms = 200;
+    auto sum = eng.run(cfg, nullptr);
+    expect(sum.transient_error_samples >= 4, "EIO transient samples");
+    expect(sum.not_found_samples == 0, "EIO not NotFound");
+    expect(!sum.stopped_early, "EIO no early termination stop");
+    expect(sum.total_samples == sum.successful_samples + sum.failed_samples, "EIO accounting");
+
+    // EMFILE-like persistent transient for full duration
+    auto reader2 = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("meminfo") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::ParseError;
+        r.detail = "open failed: Too many open files";
+        return r;
+    };
+    fars::SamplingEngine eng2(fars::ProcessMemoryCollector(reader2),
+                              fars::SystemMemoryCollector(reader2), clock_fn, sleep_fn);
+    // reset clock
+    fc.now = std::chrono::steady_clock::time_point(std::chrono::milliseconds(0));
+    auto sum2 = eng2.run(cfg, nullptr);
+    expect(sum2.failed_samples == sum2.total_samples, "EMFILE all failed");
+    expect(!sum2.stopped_early, "EMFILE completes duration");
+    expect(sum2.stop_reason.find("terminat") == std::string::npos, "EMFILE not termination");
+}
+
 int main() {
     test_metric_value();
     test_parser_well_formed();
@@ -488,6 +575,8 @@ int main() {
     test_sampling_permission_continues();
     test_sampling_transient_recovery();
     test_sampling_smaps_missing_still_success();
+    test_enoent_notfound_early_stop();
+    test_eio_emfile_transient_continue();
     if (failures == 0) {
         std::cout << "Phase 1 tests: all passed\n";
         return 0;
