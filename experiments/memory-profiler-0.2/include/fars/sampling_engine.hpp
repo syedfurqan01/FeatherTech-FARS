@@ -11,8 +11,10 @@
 #include <thread>
 #include <vector>
 namespace fars {
+
 struct MetricStats {
-    std::uint64_t min_bytes=0, max_bytes=0; double avg_bytes=0; std::size_t success_count=0, fail_count=0;
+    std::uint64_t min_bytes=0, max_bytes=0; double avg_bytes=0;
+    std::size_t success_count=0, fail_count=0;
     void add(const MetricValue& v) {
         if (!v.is_available()) { ++fail_count; return; }
         if (success_count==0) { min_bytes=max_bytes=v.value; avg_bytes=static_cast<double>(v.value); }
@@ -24,23 +26,46 @@ struct MetricStats {
         ++success_count;
     }
 };
+
 struct SampleRecord {
     std::chrono::steady_clock::time_point timestamp;
     std::int64_t elapsed_ms=0, interval_ms=0, collect_overhead_us=0;
-    ProcessMemorySnapshot process; SystemMemorySnapshot system; bool process_alive=true;
+    ProcessMemorySnapshot process;
+    SystemMemorySnapshot system;
+    bool process_alive=true;
+    ProcessObserveKind observe_kind = ProcessObserveKind::Ok;
 };
+
 struct SamplingSummary {
-    std::int32_t target_pid=0; std::size_t configured_duration_ms=0, configured_interval_ms=0;
+    std::int32_t target_pid=0;
+    std::size_t configured_duration_ms=0, configured_interval_ms=0;
     std::size_t total_samples=0, successful_samples=0, failed_samples=0, delayed_cycles=0;
+    // Failure breakdown (subset of failed_samples)
+    std::size_t not_found_samples=0;
+    std::size_t permission_denied_samples=0;
+    std::size_t transient_error_samples=0;
     MetricStats vm_rss, vm_size, vm_hwm, vm_swap, pss, private_dirty;
     std::uint64_t window_peak_rss_bytes=0; bool window_peak_rss_valid=false;
     MetricStats mem_available;
-    double avg_collect_overhead_us=0; std::int64_t max_collect_overhead_us=0, total_elapsed_ms=0;
-    bool stopped_early=false; std::string stop_reason;
+    double avg_collect_overhead_us=0;
+    std::int64_t max_collect_overhead_us=0, total_elapsed_ms=0;
+    bool stopped_early=false;
+    std::string stop_reason;
 };
+
+// Sampling early-stop policy:
+// - NotFound (process gone / never existed): stop early after counting the failed sample.
+// - PermissionDenied: count as failed, continue until duration (access may be permanent but
+//   is not the same as termination; useful on Android multi-UID).
+// - TransientError: count as failed, continue (may recover).
+// - Ok with smaps missing: still successful sample.
+// Invariant: total_samples == successful_samples + failed_samples.
+
 struct SamplingConfig {
-    std::int32_t pid=0; std::size_t duration_ms=5000, interval_ms=200, max_history=256;
-    static constexpr std::size_t kMinIntervalMs=10, kMaxIntervalMs=60000, kMinDurationMs=10, kMaxDurationMs=3600000;
+    std::int32_t pid=0;
+    std::size_t duration_ms=5000, interval_ms=200, max_history=256;
+    static constexpr std::size_t kMinIntervalMs=10, kMaxIntervalMs=60000;
+    static constexpr std::size_t kMinDurationMs=10, kMaxDurationMs=3600000;
     std::string validate() const {
         if (interval_ms<kMinIntervalMs) return "interval too small (min 10 ms)";
         if (interval_ms>kMaxIntervalMs) return "interval too large (max 60000 ms)";
@@ -50,10 +75,12 @@ struct SamplingConfig {
         return {};
     }
 };
+
 using SteadyClockNow = std::function<std::chrono::steady_clock::time_point()>;
 using SleepFor = std::function<void(std::chrono::milliseconds)>;
 inline SteadyClockNow default_clock() { return []{ return std::chrono::steady_clock::now(); }; }
 inline SleepFor default_sleep() { return [](std::chrono::milliseconds d){ std::this_thread::sleep_for(d); }; }
+
 class SamplingEngine {
 public:
     SamplingEngine(ProcessMemoryCollector proc, SystemMemoryCollector sys,
@@ -62,6 +89,8 @@ public:
     void request_stop();
 private:
     ProcessMemoryCollector proc_; SystemMemoryCollector sys_;
-    SteadyClockNow clock_; SleepFor sleep_; std::atomic<bool> stop_requested_{false};
+    SteadyClockNow clock_; SleepFor sleep_;
+    std::atomic<bool> stop_requested_{false};
 };
+
 } // namespace fars

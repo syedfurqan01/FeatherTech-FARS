@@ -180,6 +180,7 @@ static void test_sampling_death() {
     cfg.interval_ms = 100;
     auto sum = eng.run(cfg, nullptr);
     expect(sum.stopped_early, "early stop");
+    expect(sum.not_found_samples >= 1, "notfound count");
     expect(sum.failed_samples >= 1, "failed counted");
     expect(sum.successful_samples >= 1, "prior success");
     expect(sum.total_samples == sum.successful_samples + sum.failed_samples, "accounting");
@@ -331,6 +332,143 @@ static void test_storage_close_hook() {
     (void)closes_before;
 }
 
+
+static void test_observe_permission_vs_notfound() {
+    auto denied = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        if (std::string(path).find("status") != std::string::npos) {
+            r.state = fars::MetricState::PermissionDenied;
+            r.detail = "EACCES";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto snap = fars::ProcessMemoryCollector(denied).collect(50);
+    expect(snap.observe_kind == fars::ProcessObserveKind::PermissionDenied, "kind denied");
+    expect(!snap.alive, "denied not alive");
+
+    auto gone = [](std::string_view) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        r.state = fars::MetricState::Unavailable;
+        r.detail = "file not found";
+        return r;
+    };
+    auto snap2 = fars::ProcessMemoryCollector(gone).collect(51);
+    expect(snap2.observe_kind == fars::ProcessObserveKind::NotFound, "kind notfound");
+}
+
+static void test_sampling_permission_continues() {
+    FakeClock fc;
+    auto clock_fn = [&] { return fc.now; };
+    auto sleep_fn = [&](std::chrono::milliseconds d) { fc.advance(d); };
+    auto reader = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            r.state = fars::MetricState::PermissionDenied;
+            r.detail = "EACCES";
+            return r;
+        }
+        if (p.find("meminfo") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    fars::SamplingEngine eng(fars::ProcessMemoryCollector(reader),
+                             fars::SystemMemoryCollector(reader), clock_fn, sleep_fn);
+    fars::SamplingConfig cfg;
+    cfg.duration_ms = 1000;
+    cfg.interval_ms = 200;
+    auto sum = eng.run(cfg, nullptr);
+    expect(sum.failed_samples >= 4, "denied failed samples");
+    expect(sum.permission_denied_samples == sum.failed_samples, "all denied");
+    expect(!sum.stopped_early || sum.stop_reason.find("terminat") == std::string::npos,
+           "denied does not stop as termination");
+    // Should not stop early due to NotFound
+    expect(sum.not_found_samples == 0, "no notfound");
+    expect(sum.total_samples == sum.successful_samples + sum.failed_samples, "accounting denied");
+}
+
+static void test_sampling_transient_recovery() {
+    FakeClock fc;
+    auto clock_fn = [&] { return fc.now; };
+    auto sleep_fn = [&](std::chrono::milliseconds d) { fc.advance(d); };
+    int status_n = 0;
+    auto reader = [&](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            ++status_n;
+            // second sample transient, others ok
+            if (status_n == 2) {
+                r.state = fars::MetricState::ParseError;
+                r.detail = "EINTR";
+                return r;
+            }
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\t128 kB\nVmHWM:\t128 kB\nVmSize:\t256 kB\nVmSwap:\t0 kB\n";
+            return r;
+        }
+        if (p.find("smaps") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "Pss:\t64 kB\nRss:\t128 kB\nPrivate_Dirty:\t32 kB\n";
+            return r;
+        }
+        if (p.find("meminfo") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    fars::SamplingEngine eng(fars::ProcessMemoryCollector(reader),
+                             fars::SystemMemoryCollector(reader), clock_fn, sleep_fn);
+    fars::SamplingConfig cfg;
+    cfg.duration_ms = 1000;
+    cfg.interval_ms = 200;
+    auto sum = eng.run(cfg, nullptr);
+    expect(sum.transient_error_samples >= 1, "transient counted");
+    expect(sum.successful_samples >= 3, "recovered successes");
+    expect(!sum.stopped_early, "transient does not stop");
+    expect(sum.total_samples == sum.successful_samples + sum.failed_samples, "accounting transient");
+}
+
+static void test_sampling_smaps_missing_still_success() {
+    FakeClock fc;
+    auto clock_fn = [&] { return fc.now; };
+    auto sleep_fn = [&](std::chrono::milliseconds d) { fc.advance(d); };
+    auto reader = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\t256 kB\nVmHWM:\t256 kB\nVmSize:\t512 kB\nVmSwap:\t0 kB\n";
+            return r;
+        }
+        if (p.find("meminfo") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n";
+            return r;
+        }
+        // smaps unavailable
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    fars::SamplingEngine eng(fars::ProcessMemoryCollector(reader),
+                             fars::SystemMemoryCollector(reader), clock_fn, sleep_fn);
+    fars::SamplingConfig cfg;
+    cfg.duration_ms = 600;
+    cfg.interval_ms = 200;
+    auto sum = eng.run(cfg, nullptr);
+    expect(sum.successful_samples >= 2, "status-only success");
+    expect(sum.failed_samples == 0, "smaps miss not process failure");
+}
+
 int main() {
     test_metric_value();
     test_parser_well_formed();
@@ -346,6 +484,10 @@ int main() {
     test_stats_exclude_unavailable();
     test_unique_fd();
     test_storage_close_hook();
+    test_observe_permission_vs_notfound();
+    test_sampling_permission_continues();
+    test_sampling_transient_recovery();
+    test_sampling_smaps_missing_still_success();
     if (failures == 0) {
         std::cout << "Phase 1 tests: all passed\n";
         return 0;
