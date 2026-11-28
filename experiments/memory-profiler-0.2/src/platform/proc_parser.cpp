@@ -8,27 +8,54 @@ std::string_view ltrim(std::string_view s) {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
     return s;
 }
-std::string_view first_integer_token(std::string_view s) {
-    s = ltrim(s);
-    if (s.empty()) return {};
-    std::size_t i = (s[0] == '+') ? 1 : 0, start = i;
-    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
-    return (i == start) ? std::string_view{} : s.substr(start, i - start);
+std::string_view rtrim(std::string_view s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
+    return s;
 }
-}
+} // namespace
+
+// Accept: [whitespace] [+] digits [whitespace] [kB] [whitespace]
+// Reject: decimals, trailing garbage (e.g. 123garbage), empty, non-integer units.
 MetricValue parse_kb_token(std::string_view token) {
     token = ltrim(token);
     if (token.empty()) return MetricValue::make_parse_error("empty token");
-    auto t = first_integer_token(token);
-    if (t.empty()) return MetricValue::make_parse_error("no integer found");
+
+    std::size_t i = 0;
+    if (token[i] == '+') ++i;
+    if (i >= token.size() || !std::isdigit(static_cast<unsigned char>(token[i])))
+        return MetricValue::make_parse_error("no integer found");
+
+    const std::size_t num_start = i;
+    while (i < token.size() && std::isdigit(static_cast<unsigned char>(token[i]))) ++i;
+    // Reject decimal / fractional forms (e.g. 123.5)
+    if (i < token.size() && token[i] == '.')
+        return MetricValue::make_parse_error("non-integer numeric value");
+
+    std::string_view num = token.substr(num_start, i - num_start);
     std::uint64_t kb = 0;
-    auto [ptr, ec] = std::from_chars(t.data(), t.data() + t.size(), kb);
-    if (ec != std::errc{} || ptr != t.data() + t.size())
+    auto [ptr, ec] = std::from_chars(num.data(), num.data() + num.size(), kb);
+    if (ec != std::errc{} || ptr != num.data() + num.size())
         return MetricValue::make_parse_error("invalid integer");
+
+    // Remainder after digits: only whitespace and optional trailing "kB"
+    std::string_view rest = token.substr(i);
+    rest = ltrim(rest);
+    if (!rest.empty()) {
+        if (rest.size() >= 2 && rest[0] == 'k' && rest[1] == 'B') {
+            rest.remove_prefix(2);
+            rest = ltrim(rest);
+            if (!rest.empty())
+                return MetricValue::make_parse_error("trailing garbage after unit");
+        } else {
+            return MetricValue::make_parse_error("trailing non-numeric characters");
+        }
+    }
+
     if (kb > std::numeric_limits<std::uint64_t>::max() / 1024ULL)
         return MetricValue::make_parse_error("kB value overflows bytes");
     return MetricValue::make_available(kb * 1024ULL);
 }
+
 MetricValue find_kb_field(std::string_view content, std::string_view key) {
     std::size_t pos = 0;
     while (pos < content.size()) {
@@ -41,6 +68,7 @@ MetricValue find_kb_field(std::string_view content, std::string_view key) {
     }
     return MetricValue::make_unavailable();
 }
+
 StatusMetrics parse_status(std::string_view c) {
     StatusMetrics m;
     if (c.empty()) {
@@ -53,6 +81,7 @@ StatusMetrics parse_status(std::string_view c) {
     m.vm_swap = find_kb_field(c, "VmSwap:");
     return m;
 }
+
 MeminfoMetrics parse_meminfo(std::string_view c) {
     MeminfoMetrics m;
     if (c.empty()) {
@@ -69,6 +98,7 @@ MeminfoMetrics parse_meminfo(std::string_view c) {
     m.swap_free = find_kb_field(c, "SwapFree:");
     return m;
 }
+
 SmapsRollupMetrics parse_smaps_rollup(std::string_view c) {
     SmapsRollupMetrics m;
     if (c.empty()) {
@@ -84,4 +114,5 @@ SmapsRollupMetrics parse_smaps_rollup(std::string_view c) {
     m.shared_dirty = find_kb_field(c, "Shared_Dirty:");
     return m;
 }
+
 } // namespace fars

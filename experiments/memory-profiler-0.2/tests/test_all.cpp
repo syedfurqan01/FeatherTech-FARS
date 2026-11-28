@@ -690,6 +690,52 @@ static void test_malformed_then_recovery() {
     expect(sum.total_samples == sum.successful_samples + sum.failed_samples, "malformed accounting");
 }
 
+
+static void test_parse_kb_token_strict() {
+    // valid
+    expect_avail(fars::parse_kb_token("1024 kB"), 1024ULL * 1024, "normal kB");
+    expect_avail(fars::parse_kb_token("0 kB"), 0, "valid zero");
+    expect_avail(fars::parse_kb_token("  42  kB  "), 42ULL * 1024, "whitespace");
+    // reject trailing garbage
+    expect_state(fars::parse_kb_token("123garbage kB"), fars::MetricState::ParseError, "123garbage");
+    expect_state(fars::parse_kb_token("123.5 kB"), fars::MetricState::ParseError, "decimal");
+    expect_state(fars::parse_kb_token(""), fars::MetricState::ParseError, "empty");
+    expect_state(fars::parse_kb_token("kB"), fars::MetricState::ParseError, "unit only");
+    // overflow
+    expect_state(fars::parse_kb_token("18014398509481984 kB"), fars::MetricState::ParseError, "overflow");
+
+    // Collector: malformed required VmRSS
+    auto bad_req = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        if (std::string(path).find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\t123garbage kB\nVmHWM:\t100 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto s = fars::ProcessMemoryCollector(bad_req).collect(1);
+    expect(s.observe_kind == fars::ProcessObserveKind::TransientError, "garbage VmRSS TransientError");
+    expect(s.vm_rss.state == fars::MetricState::ParseError, "garbage VmRSS ParseError");
+
+    // Optional malformed HWM: sample still Ok
+    auto bad_opt = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\t64 kB\nVmHWM:\t123garbage kB\nVmSize:\t128 kB\nVmSwap:\t0 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto s2 = fars::ProcessMemoryCollector(bad_opt).collect(1);
+    expect(s2.observe_kind == fars::ProcessObserveKind::Ok, "optional garbage still Ok");
+    expect(s2.vm_hwm.state == fars::MetricState::ParseError, "optional HWM ParseError");
+}
+
 int main() {
     test_metric_value();
     test_parser_well_formed();
@@ -713,6 +759,7 @@ int main() {
     test_eio_emfile_transient_continue();
     test_status_parse_validation();
     test_malformed_then_recovery();
+    test_parse_kb_token_strict();
     if (failures == 0) {
         std::cout << "Phase 1 tests: all passed\n";
         return 0;
