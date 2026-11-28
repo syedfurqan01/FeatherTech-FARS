@@ -6,6 +6,7 @@
 #include "fars/system_memory.hpp"
 #include "fars/sampling_engine.hpp"
 #include "fars/storage_benchmark.hpp"
+#include "fars/unique_fd.hpp"
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include <fcntl.h>
 #include <vector>
 namespace fs = std::filesystem;
 static int failures = 0;
@@ -251,6 +253,40 @@ static void test_stats_exclude_unavailable() {
     expect(st.success_count == 2 && st.fail_count == 1, "stats counts");
     expect(st.min_bytes == 0 && st.max_bytes == 100, "stats min max");
 }
+
+static void test_unique_fd() {
+    // invalid fd: no close crash
+    {
+        fars::UniqueFd empty;
+        expect(!empty, "default empty");
+        expect(empty.get() == -1, "default -1");
+    }
+    // open /proc/self/status or /dev/null
+    int raw = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    expect(raw >= 0, "open /dev/null");
+    {
+        fars::UniqueFd fd(raw);
+        expect(static_cast<bool>(fd), "owns fd");
+        expect(fd.get() == raw, "get matches");
+        // move
+        fars::UniqueFd fd2(std::move(fd));
+        expect(!fd, "moved-from empty");
+        expect(fd2.get() == raw, "move target owns");
+        int released = fd2.release();
+        expect(released == raw, "release value");
+        expect(!fd2, "released empty");
+        ::close(released); // we own again after release
+    }
+    // reset closes
+    int raw2 = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    expect(raw2 >= 0, "open2");
+    {
+        fars::UniqueFd fd(raw2);
+        fd.reset();
+        expect(!fd, "after reset");
+    }
+}
+
 int main() {
     test_metric_value();
     test_parser_well_formed();
@@ -264,6 +300,7 @@ int main() {
     test_storage_invalid_and_cleanup();
     test_storage_fsync_hook();
     test_stats_exclude_unavailable();
+    test_unique_fd();
     if (failures == 0) {
         std::cout << "Phase 1 tests: all passed\n";
         return 0;

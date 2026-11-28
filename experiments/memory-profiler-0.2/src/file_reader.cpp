@@ -1,37 +1,49 @@
 #include "fars/file_reader.hpp"
+#include "fars/unique_fd.hpp"
+
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <unistd.h>
 #include <vector>
+
 namespace fars {
+
 FileReadResult default_file_reader(std::string_view path) {
     FileReadResult r;
     std::string p(path);
-    int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        r.state = (errno == EACCES || errno == EPERM) ? MetricState::PermissionDenied
-                                                      : MetricState::Unavailable;
-        r.detail = (errno == ENOENT) ? "file not found" : std::strerror(errno);
+
+    UniqueFd fd(::open(p.c_str(), O_RDONLY | O_CLOEXEC));
+    if (!fd) {
+        if (errno == EACCES || errno == EPERM) {
+            r.state = MetricState::PermissionDenied;
+            r.detail = std::strerror(errno);
+        } else if (errno == ENOENT) {
+            r.state = MetricState::Unavailable;
+            r.detail = "file not found";
+        } else {
+            r.state = MetricState::Unavailable;
+            r.detail = std::strerror(errno);
+        }
         return r;
     }
+
     std::vector<char> buf;
     char tmp[4096];
     for (;;) {
-        ssize_t n = ::read(fd, tmp, sizeof(tmp));
+        ssize_t n = ::read(fd.get(), tmp, sizeof(tmp));
         if (n < 0) {
             if (errno == EINTR) continue;
             r.state = MetricState::ParseError;
             r.detail = std::strerror(errno);
-            ::close(fd);
-            return r;
+            return r; // UniqueFd closes
         }
         if (n == 0) break;
         buf.insert(buf.end(), tmp, tmp + n);
     }
-    ::close(fd);
+
     r.state = MetricState::Available;
     r.content.assign(buf.begin(), buf.end());
-    return r;
+    return r; // UniqueFd closes
 }
+
 } // namespace fars

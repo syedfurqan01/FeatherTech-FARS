@@ -1,4 +1,5 @@
 #include "fars/storage_benchmark.hpp"
+#include "fars/unique_fd.hpp"
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -66,10 +67,16 @@ bool StorageBenchmark::prepare_file(const StorageBenchmarkConfig& cfg,std::strin
     }
     auto unique=std::chrono::steady_clock::now().time_since_epoch().count();
     path_out=(fs::path(cfg.target_dir)/("fars_storage_bench_"+std::to_string(unique)+".tmp")).string();
-    int fd=hooks_.open_fn(path_out.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0600);
-    if(fd<0){ err=std::string("open failed: ")+std::strerror(errno); path_out.clear(); return false; }
-    if(!ensure_file_size(fd,cfg.file_size_bytes,err)){ hooks_.close_fn(fd); cleanup_file(path_out,err); path_out.clear(); return false; }
-    fd_out=fd; return true;
+    UniqueFd fd(hooks_.open_fn(path_out.c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0600));
+    if(!fd){ err=std::string("open failed: ")+std::strerror(errno); path_out.clear(); return false; }
+    if(!ensure_file_size(fd.get(),cfg.file_size_bytes,err)){
+        fd.reset(); // close before unlink
+        cleanup_file(path_out,err);
+        path_out.clear();
+        return false;
+    }
+    fd_out=fd.release(); // transfer ownership to caller
+    return true;
 }
 static double ems(std::chrono::steady_clock::time_point s){
     return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-s).count();
@@ -163,16 +170,17 @@ StorageBenchmarkResult StorageBenchmark::run(const StorageBenchmarkConfig& cfg){
     StorageBenchmarkResult res; res.config=cfg;
     res.mode_label=to_string(cfg.mode); res.sync_policy_label=to_string(cfg.sync_policy);
     if(auto err=cfg.validate(); !err.empty()){ res.error=err; return res; }
-    std::string path; int fd=-1; std::string err;
-    if(!prepare_file(cfg,path,fd,err)){ res.error=err; return res; }
+    std::string path; int raw_fd=-1; std::string err;
+    if(!prepare_file(cfg,path,raw_fd,err)){ res.error=err; return res; }
+    UniqueFd fd(raw_fd); // owns descriptor until scope exit
     res.test_file_path=path;
     switch(cfg.mode){
-        case StorageTestMode::SequentialWrite: res=run_sequential_write(cfg,path,fd); break;
-        case StorageTestMode::SequentialRead: res=run_sequential_read(cfg,path,fd); break;
-        case StorageTestMode::RandomWrite: res=run_random_write(cfg,path,fd); break;
-        case StorageTestMode::RandomRead: res=run_random_read(cfg,path,fd); break;
+        case StorageTestMode::SequentialWrite: res=run_sequential_write(cfg,path,fd.get()); break;
+        case StorageTestMode::SequentialRead: res=run_sequential_read(cfg,path,fd.get()); break;
+        case StorageTestMode::RandomWrite: res=run_random_write(cfg,path,fd.get()); break;
+        case StorageTestMode::RandomRead: res=run_random_read(cfg,path,fd.get()); break;
     }
-    hooks_.close_fn(fd);
+    fd.reset(); // close before unlink
     std::string cerr; res.cleanup_ok=cleanup_file(path,cerr);
     if(!res.cleanup_ok){ if(!res.error.empty()) res.error+="; "; res.error+=cerr; }
     return res;
