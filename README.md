@@ -127,3 +127,9 @@ Copyright (c) 2026 syedfurqan01 / FeatherTech.
 
 **FeatherTech FARS**  
 Making Intelligence Adapt to Hardware.
+## Experiments
+
+- `experiments/memory-profiler-0.1/` — baseline profiler (frozen)
+- `experiments/memory-profiler-0.2/` — unified FARS 0.2 measurement engine (MetricValue, collectors, SamplingEngine, StorageBenchmark 2.0)
+
+See `experiments/memory-profiler-0.2/README.md` and `TERMUX.md` for build and device testing.
