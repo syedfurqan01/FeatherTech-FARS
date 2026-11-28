@@ -556,6 +556,140 @@ static void test_eio_emfile_transient_continue() {
     expect(sum2.stop_reason.find("terminat") == std::string::npos, "EMFILE not termination");
 }
 
+
+static void test_status_parse_validation() {
+    // Fully valid status
+    auto ok_reader = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\t512 kB\nVmSize:\t2048 kB\nVmHWM:\t768 kB\nVmSwap:\t0 kB\n";
+            return r;
+        }
+        if (p.find("smaps") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "Pss:\t256 kB\nRss:\t512 kB\nPrivate_Dirty:\t64 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto ok = fars::ProcessMemoryCollector(ok_reader).collect(1);
+    expect(ok.observe_kind == fars::ProcessObserveKind::Ok, "valid status Ok");
+    expect(ok.alive, "valid alive");
+    expect(ok.vm_rss.is_available() && ok.vm_rss.value == 512ULL * 1024, "valid RSS");
+
+    // Malformed VmRSS
+    auto mal_rss = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        if (std::string(path).find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\tnot_a_number kB\nVmSize:\t2048 kB\nVmHWM:\t768 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto m = fars::ProcessMemoryCollector(mal_rss).collect(1);
+    expect(m.observe_kind == fars::ProcessObserveKind::TransientError, "bad VmRSS transient");
+    expect(!m.alive, "bad VmRSS not alive");
+    expect(m.vm_rss.state == fars::MetricState::ParseError, "VmRSS ParseError");
+
+    // Malformed optional VmHWM — sample still Ok if VmRSS good
+    auto mal_hwm = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\t256 kB\nVmSize:\t1024 kB\nVmHWM:\txx kB\nVmSwap:\t0 kB\n";
+            return r;
+        }
+        if (p.find("smaps") != std::string::npos) {
+            r.state = fars::MetricState::Unavailable;
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto h = fars::ProcessMemoryCollector(mal_hwm).collect(1);
+    expect(h.observe_kind == fars::ProcessObserveKind::Ok, "optional HWM malformed still Ok");
+    expect(h.vm_rss.is_available(), "RSS still available");
+    expect(h.vm_hwm.state == fars::MetricState::ParseError, "HWM ParseError preserved");
+
+    // Missing optional VmSwap only
+    auto miss_opt = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "VmRSS:\t128 kB\nVmSize:\t512 kB\nVmHWM:\t128 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto o = fars::ProcessMemoryCollector(miss_opt).collect(1);
+    expect(o.observe_kind == fars::ProcessObserveKind::Ok, "missing optional Ok");
+    expect(o.vm_swap.state == fars::MetricState::Unavailable, "VmSwap unavailable not zero");
+
+    // Missing required VmRSS
+    auto miss_rss = [](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        if (std::string(path).find("status") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "Name:\tfoo\nVmSize:\t512 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    auto mr = fars::ProcessMemoryCollector(miss_rss).collect(1);
+    expect(mr.observe_kind == fars::ProcessObserveKind::TransientError, "missing VmRSS transient");
+}
+
+static void test_malformed_then_recovery() {
+    FakeClock fc;
+    auto clock_fn = [&] { return fc.now; };
+    auto sleep_fn = [&](std::chrono::milliseconds d) { fc.advance(d); };
+    int n = 0;
+    auto reader = [&](std::string_view path) -> fars::FileReadResult {
+        fars::FileReadResult r;
+        std::string p(path);
+        if (p.find("status") != std::string::npos) {
+            ++n;
+            r.state = fars::MetricState::Available;
+            if (n == 1)
+                r.content = "VmRSS:\tbad kB\nVmHWM:\t100 kB\n";
+            else
+                r.content = "VmRSS:\t200 kB\nVmHWM:\t200 kB\nVmSize:\t400 kB\nVmSwap:\t0 kB\n";
+            return r;
+        }
+        if (p.find("smaps") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "Pss:\t100 kB\nRss:\t200 kB\nPrivate_Dirty:\t10 kB\n";
+            return r;
+        }
+        if (p.find("meminfo") != std::string::npos) {
+            r.state = fars::MetricState::Available;
+            r.content = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n";
+            return r;
+        }
+        r.state = fars::MetricState::Unavailable;
+        return r;
+    };
+    fars::SamplingEngine eng(fars::ProcessMemoryCollector(reader),
+                             fars::SystemMemoryCollector(reader), clock_fn, sleep_fn);
+    fars::SamplingConfig cfg;
+    cfg.duration_ms = 1000;
+    cfg.interval_ms = 200;
+    auto sum = eng.run(cfg, nullptr);
+    expect(sum.transient_error_samples >= 1, "malformed failed");
+    expect(sum.successful_samples >= 2, "recovery success");
+    expect(!sum.stopped_early, "malformed not termination");
+    expect(sum.total_samples == sum.successful_samples + sum.failed_samples, "malformed accounting");
+}
+
 int main() {
     test_metric_value();
     test_parser_well_formed();
@@ -577,6 +711,8 @@ int main() {
     test_sampling_smaps_missing_still_success();
     test_enoent_notfound_early_stop();
     test_eio_emfile_transient_continue();
+    test_status_parse_validation();
+    test_malformed_then_recovery();
     if (failures == 0) {
         std::cout << "Phase 1 tests: all passed\n";
         return 0;

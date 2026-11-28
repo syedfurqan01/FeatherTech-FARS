@@ -49,7 +49,6 @@ ProcessMemorySnapshot ProcessMemoryCollector::collect(std::int32_t pid) const {
     }
 
     if (status_res.state == MetricState::Unavailable) {
-        // Reserved for missing path (ENOENT) — not found or terminated
         s.alive = false;
         s.observe_kind = ProcessObserveKind::NotFound;
         s.vm_rss = s.vm_size = s.vm_hwm = s.vm_swap =
@@ -60,7 +59,6 @@ ProcessMemorySnapshot ProcessMemoryCollector::collect(std::int32_t pid) const {
     }
 
     if (status_res.state != MetricState::Available) {
-        // Any other non-success state: do not treat as termination
         s.alive = false;
         s.observe_kind = ProcessObserveKind::TransientError;
         s.vm_rss = s.vm_size = s.vm_hwm = s.vm_swap =
@@ -70,13 +68,32 @@ ProcessMemorySnapshot ProcessMemoryCollector::collect(std::int32_t pid) const {
         return s;
     }
 
-    s.alive = true;
-    s.observe_kind = ProcessObserveKind::Ok;
+    // File readable — parse before declaring Ok.
+    // Required for Ok: VmRSS Available (bytes, including valid zero).
+    // Optional: VmSize, VmHWM, VmSwap may be Unavailable or ParseError without
+    // failing the sample; values are never invented as Available(0).
     auto st = parse_status(status_res.content);
     s.vm_rss = st.vm_rss;
     s.vm_size = st.vm_size;
     s.vm_hwm = st.vm_hwm;
     s.vm_swap = st.vm_swap;
+
+    if (st.vm_rss.state == MetricState::ParseError) {
+        s.alive = false;
+        s.observe_kind = ProcessObserveKind::TransientError;
+        s.notes = "malformed required field VmRSS";
+        return s;
+    }
+    if (!st.vm_rss.is_available()) {
+        // Missing required key in an otherwise readable status file
+        s.alive = false;
+        s.observe_kind = ProcessObserveKind::TransientError;
+        s.notes = "missing required field VmRSS";
+        return s;
+    }
+
+    s.alive = true;
+    s.observe_kind = ProcessObserveKind::Ok;
 
     auto smaps_res = reader_(proc_path(pid, "smaps_rollup"));
     if (smaps_res.state == MetricState::Available) {
